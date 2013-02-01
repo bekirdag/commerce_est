@@ -1,0 +1,6 @@
+name = Est payment gateway
+description = This is a gateway for Turkish banks using Est 
+package = Commerce
+dependencies[] = commerce
+dependencies[] = commerce_payment
+core = 7.x

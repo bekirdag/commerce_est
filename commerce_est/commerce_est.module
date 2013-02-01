@@ -1,0 +1,474 @@
+<?php
+
+/**
+ * @file
+ * Provides Turkish Banks Est payment method for Drupal Commerce
+ */
+
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_est_menu() {
+	$items['admin/commerce/config/payment/est'] = array(
+	  'title' => 'Est gateway',
+	  'description' => 'Est payment gateway settings.',
+	  'page callback' => 'commerce_est_settings',
+	  'access arguments' => array('administer site configuration'),
+	  'type' => MENU_LOCAL_TASK
+	);
+	
+	return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_est_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['commerce_est'] = array(
+    'title' => t('Credit Card'),
+    'description' => t('Credit card payement method for Turkish Banks Est gateway.'),
+    'active' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function commerce_est_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Prepare the fields to include on the credit card form.
+  $fields = array(
+    'code' => '',
+  );
+
+  // // Add the credit card types array if necessary.
+  // $card_types = array_diff(array_values($payment_method['settings']['card_types']), array(0));
+  // 
+  // if (!empty($card_types)) {
+  //   $fields['type'] = $card_types;
+  // }
+
+  return commerce_payment_credit_card_form($fields);
+}
+
+
+/**
+ * Payment method callback: checkout form validation.
+ */
+function commerce_est_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Validate the credit card fields.
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_card')),
+  );
+
+  if (!commerce_payment_credit_card_validate($pane_values['credit_card'], $settings)) {
+    return FALSE;
+  }
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function commerce_est_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+
+  // Determine the credit card type if possible for use in later code.
+  if (!empty($pane_values['credit_card']['number'])) {
+    module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+    $card_type = commerce_payment_validate_credit_card_type($pane_values['credit_card']['number'], array_keys(commerce_payment_credit_card_types()));
+  }
+
+  // If the charge amount is 0...
+  if ($charge['amount'] == 0) {
+    // Prevent the transaction except under limited circumstances.
+    $prevent_transaction = TRUE;
+
+    // If the transaction should still be prevented...
+    if ($prevent_transaction) {
+      // Create a transaction to log the skipped transaction and display a
+      // helpful message to the customer.
+      $transaction = commerce_payment_transaction_new('commerce_est', $order->order_id);
+      $transaction->amount = $charge['amount'];
+      $transaction->currency_code = $charge['currency_code'];
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('Invalid @amount transaction not attempted.', array('@amount' => commerce_currency_format($charge['amount'], $charge['currency_code'])));
+      commerce_payment_transaction_save($transaction);
+
+      drupal_set_message('We encountered an error processing your transaction. Please contact us to resolve the issue.', 'error');
+      return FALSE;
+    }
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Get the default transaction type from the payment method settings.
+  $txn_type = $payment_method['settings']['txn_type'];
+
+  // If txn_type has been specified in the pane values array, such as through
+  // the special select element we alter onto the payment terminal form, use
+  // that instead.
+  if (!empty($pane_values['txn_type'])) {
+    $txn_type = $pane_values['txn_type'];
+  }
+
+  // Build a name-value pair array for this transaction.
+  $nvp = array(
+    'x_type' => commerce_est_txn_type($txn_type),
+    'x_method' => 'CC',
+    'x_amount' => commerce_currency_amount_to_decimal($charge['amount'], $charge['currency_code']),
+    'x_card_num' => $pane_values['credit_card']['number'],
+    'x_exp_date' => $pane_values['credit_card']['exp_month'] . $pane_values['credit_card']['exp_year'],
+    'x_exp_month' => $pane_values['credit_card']['exp_month'],
+    'x_exp_year' => $pane_values['credit_card']['exp_year'],
+  );
+
+  if (isset($pane_values['credit_card']['code'])) {
+    $nvp['x_card_code'] = $pane_values['credit_card']['code'];
+  }
+
+  // Build a description for the order.
+  $description = array();
+
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+    }
+  }
+
+  // Add additional transaction invormation to the request array.
+// var_dump($order->order_number);exit();
+  $nvp += array(
+    // Order Information
+    'x_invoice_num' => "7382783".$order->order_number,
+    'x_description' => substr(implode(', ', $description), 0, 255),
+
+    // Customer Information
+    'x_email' => substr($order->mail, 0, 255),
+    'x_cust_id' => substr($order->uid, 0, 20),
+    'x_customer_ip' => substr(ip_address(), 0, 15),
+  );
+
+  // Prepare the billing address for use in the request.
+  if ($order_wrapper->commerce_customer_billing->value()){
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+    if (empty($billing_address['first_name'])) {
+      $name_parts = explode(' ', $billing_address['name_line']);
+      $billing_address['first_name'] = array_shift($name_parts);
+      $billing_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $nvp += array(
+      // Customer Billing Address
+      'x_first_name' => substr($billing_address['first_name'], 0, 50),
+      'x_last_name' => substr($billing_address['last_name'], 0, 50),
+      'x_company' => substr($billing_address['organisation_name'], 0, 50),
+      'x_address' => substr($billing_address['thoroughfare'], 0, 60),
+      'x_city' => substr($billing_address['locality'], 0, 40),
+      'x_state' => substr($billing_address['administrative_area'], 0, 40),
+      'x_zip' => substr($billing_address['postal_code'], 0, 20),
+      'x_country' => $billing_address['country'],
+    );
+  }
+  else {
+    $billing_address = array();
+  }
+
+  // Submit the request to Authorize.Net.
+  $response = commerce_commerce_est_request($payment_method, $nvp);
+  // var_dump($response);exit();
+
+  // var_dump($response);exit();
+  // Prepare a transaction object to log the API response.
+  $transaction = commerce_payment_transaction_new('commerce_est', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $response[6];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->payload[REQUEST_TIME] = $response;
+  
+  // If we didn't get an approval response code...
+  if ($response["response"]=="Error") {
+    // Create a failed transaction with the error message.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+  }
+  else {
+    // Set the transaction status based on the type of transaction this was.
+    switch ($txn_type) {
+      case COMMERCE_CREDIT_AUTH_ONLY:
+        $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+        break;
+  
+      case COMMERCE_CREDIT_AUTH_CAPTURE:
+        $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+        break;
+  
+      case COMMERCE_CREDIT_CAPTURE_ONLY:
+        $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+        break;
+    }
+  }
+  
+  // Store the type of transaction in the remote status.
+  $transaction->remote_status = $response[11];
+  
+  
+  // $transaction->message = implode('<br />', $message);
+/*
+	TODO work on this
+*/
+  
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+  
+  // If the payment failed, display an error and rebuild the form.
+  if ($response["response"]=="Error") {
+    drupal_set_message(t('We received the following error processing your card. Please enter you information again or try a different card.'), 'error');
+    drupal_set_message(check_plain($response["error_msg"]) . " Hata kodu:".$response["return_code"], 'error');
+    return FALSE;
+  }
+}
+
+
+/**
+ * Submits an AIM API request to Authorize.Net.
+ *
+ * @param $payment_method
+ *   The payment method instance array associated with this API request.
+ */
+function commerce_commerce_est_request($payment_method, $nvp = array()) {
+  module_load_include('inc', 'commerce_est', 'est');
+  $slug = variable_get("commerce_est_slug");
+  $company = variable_get("commerce_est_company");
+  $name = variable_get("commerce_est_name");
+  $password = variable_get("commerce_est_password");
+  $debug = variable_get("commerce_est_debug");
+
+  $est = new EST($slug, $company, $name, $password, $debug);
+
+  $extra = array(
+  					"email" => $nvp['x_email'],
+  					"ipaddress" => $nvp['x_customer_ip'],
+  					"userid" => $nvp['x_cust_id'],
+					"billing_address_name" => $nvp['x_first_name']." ".$nvp['x_last_name'],
+					"billing_address_street1" => $nv['x_address'],
+					"billing_address_city" => $nv['x_city'],
+					"billing_address_company" => $nv['x_company'],
+					"billing_address_postalcode" => $nv['x_zip'],
+					"billing_address_state" => $nv['x_state'],
+  					);
+
+  //send the payment request
+  $response = $est->pay($nvp['x_card_num'], $nvp['x_card_code'], $nvp['x_exp_month'], $nvp['x_exp_year'], $nvp['x_amount'], '', $nvp['x_invoice_num'], "Auth", $extra);
+  // $response = $est->pay("4508034508034509", "000", "12", "13", "18", '', "2567373", "Auth", $extra);
+
+  // Add the default name-value pairs to the array.
+  $nvp += array(
+    // API credentials
+    'x_login' => $payment_method['settings']['login'],
+    'x_tran_key' => $payment_method['settings']['tran_key'],
+    'x_version' => '3.1',
+
+    // Extra administrative values
+    'x_test_request' => $payment_method['settings']['txn_mode'] == AUTHNET_TXN_MODE_LIVE_TEST ? 'TRUE' : 'FALSE',
+    'x_delim_data' => 'TRUE',
+    'x_delim_char' => '|',
+    'x_encap_char' => '"',
+    'x_relay_response' => 'FALSE',
+    'x_email_customer' => $payment_method['settings']['email_customer'],
+  );
+
+  // Allow modules to alter parameters of the API request.
+  drupal_alter('commerce_est_aim_request', $nvp);
+
+  // Log the request if specified.
+  if ($payment_method['settings']['log']['request'] == 'request') {
+    // Mask the credit card number and CVV.
+    $log_nvp = $nvp;
+    $log_nvp['x_login'] = str_repeat('X', strlen($log_nvp['x_login']));
+    $log_nvp['x_tran_key'] = str_repeat('X', strlen($log_nvp['x_tran_key']));
+
+    if (!empty($log_nvp['x_card_num'])) {
+      $log_nvp['x_card_num'] = str_repeat('X', strlen($log_nvp['x_card_num']) - 4) . substr($log_nvp['x_card_num'], -4);
+    }
+
+    if (!empty($log_nvp['x_card_code'])) {
+      $log_nvp['x_card_code'] = str_repeat('X', strlen($log_nvp['x_card_code']));
+    }
+
+    watchdog('commerce_est', 'Est payment request to @url: !param', array('@url' => $url, '!param' => '<pre>' . check_plain(print_r($log_nvp, TRUE)) . '</pre>'), WATCHDOG_DEBUG);
+  }
+
+  // Log the response if specified.
+  if ($payment_method['settings']['log']['response'] == 'response') {
+    watchdog('commerce_est', 'Est response: !param', array('!param' => '<pre>' . check_plain(print_r($response, TRUE)) . '</pre>', WATCHDOG_DEBUG));
+  }
+
+  return $response;
+}
+
+/**
+ * Creates an example payment transaction for the specified charge amount.
+ *
+ * @param $payment_method
+ *   The payment method instance object used to charge this payment.
+ * @param $order
+ *   The order object the payment applies to.
+ * @param $charge
+ *   An array indicating the amount and currency code to charge.
+ * @param $name
+ *   The name entered on the submission form.
+ */
+function commerce_est_transaction($payment_method, $order, $charge, $name) {
+  $transaction = commerce_payment_transaction_new('commerce_est', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message = 'Name: @name';
+  $transaction->message_variables = array('@name' => $name);
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Form builder function for module settings.
+ */
+function commerce_est_settings() {
+	return drupal_get_form('commerce_est_settings_form');
+}
+
+function commerce_est_settings_form()
+{
+	$form['commerce_est_slug'] = array(
+		'#type' => 'select',
+	'#title' => t('Select the bank you work with'),
+	'#options' => array('akbank'=>t("Akbank"),'anadolubank'=>t("Anadolubank"),'garanti'=>t("Garanti bankası"),'finansbank'=>t("Finansbank"),'halnkbank'=>t("Halkbankası"),'isbank'=>t("İş bankası")),
+	'#required' => TRUE,
+	'#default_value' => variable_get('commerce_est_slug', ""),
+	);
+	$form['commerce_est_company'] = array(
+		'#type' => 'textfield',
+	'#title' => t('Merchant id'),
+	'#default_value' => variable_get('commerce_est_company', ""),
+	'#description' => t('This is the your merchant id.'),
+	'#required' => TRUE,
+	);
+	$form['commerce_est_name'] = array(
+		'#type' => 'textfield',
+	'#title' => t('Name'),
+	'#default_value' => variable_get('commerce_est_name', ""),
+	'#required' => TRUE,
+	);
+	$form['commerce_est_password'] = array(
+		'#type' => 'password',
+	'#title' => t('Password'),
+	'#default_value' => variable_get('commerce_est_password', ""),
+	'#required' => TRUE,
+	);
+	$form['commerce_est_debug'] = array(
+		'#type' => 'select',
+	'#title' => t('Debug mode'),
+	'#options' => array('true'=>t("True"),'false'=>t("False")),
+	'#required' => TRUE,
+	'#default_value' => variable_get('commerce_est_debug', ""),
+	);
+	$form['submit'] = array('#type' => 'submit', '#value' => t('Submit'));
+
+	return $form;
+}
+
+function commerce_est_settings_form_submit($form_id, $form_values) {
+	foreach ($form_values["values"] as $key => $value) {
+		variable_set($key,$value);
+	}
+	drupal_set_message(t("Your changes have been saved"));
+}
+
+
+/**
+ * Returns the message text for a CVV match.
+ */
+function commerce_est_cvv_response($code) {
+  switch ($code) {
+    case 'M':
+      return t('Match');
+    case 'N':
+      return t('No Match');
+    case 'P':
+      return t('Not Processed');
+    case 'S':
+      return t('Should have been present');
+    case 'U':
+      return t('Issuer unable to process request');
+  }
+
+  return '-';
+}
+
+/**
+ * Returns the description of an Authorize.Net transaction type.
+ *
+ * @param $txn_type
+ *   An Authorize.Net transaction type string.
+ */
+function commerce_est_reverse_txn_type($txn_type) {
+  switch (strtoupper($txn_type)) {
+    case 'AUTH_ONLY':
+      return t('Authorization only');
+    case 'PRIOR_AUTH_CAPTURE':
+      return t('Prior authorization capture');
+    case 'AUTH_CAPTURE':
+      return t('Authorization and capture');
+    case 'CAPTURE_ONLY':
+      return t('Capture only');
+    case 'CREDIT':
+      return t('Credit');
+    case 'VOID':
+      return t('Void');
+  }
+}
+
+/**
+ * Returns the transaction type string for Authorize.Net that corresponds to the
+ *   Drupal Commerce constant.
+ *
+ * @param $txn_type
+ *   A Drupal Commerce transaction type constant.
+ */
+function commerce_est_txn_type($txn_type) {
+  switch ($txn_type) {
+    case COMMERCE_CREDIT_AUTH_ONLY:
+      return 'AUTH_ONLY';
+    case COMMERCE_CREDIT_PRIOR_AUTH_CAPTURE:
+      return 'PRIOR_AUTH_CAPTURE';
+    case COMMERCE_CREDIT_AUTH_CAPTURE:
+      return 'AUTH_CAPTURE';
+    case COMMERCE_CREDIT_CAPTURE_ONLY:
+      return 'CAPTURE_ONLY';
+    case COMMERCE_CREDIT_REFERENCE_SET:
+    case COMMERCE_CREDIT_REFERENCE_TXN:
+    case COMMERCE_CREDIT_REFERENCE_REMOVE:
+    case COMMERCE_CREDIT_REFERENCE_CREDIT:
+      return NULL;
+    case COMMERCE_CREDIT_CREDIT:
+      return 'CREDIT';
+    case COMMERCE_CREDIT_VOID:
+      return 'VOID';
+  }
+}
+
+
+
+
+
+
+
+
